@@ -17,8 +17,97 @@ from composer.utils import MissingConditionalImportError, module_surgery
 
 log = logging.getLogger(__name__)
 
-__all__ = ['Alibi', 'apply_alibi']
+__all__ = ['Alibi', 'apply_alibi', 'apply_alibi_with_pos']
 
+def apply_alibi_with_pos(
+    model: torch.nn.Module,
+    max_sequence_length: int,
+    optimizers: Optional[Union[Optimizer, Sequence[Optimizer]]] = None,
+) -> None:
+    """Removes position embeddings and replaces the attention function and attention mask
+    as per :class:`.Alibi`. Note that the majority of the training speed-up from using ALiBi
+    comes from being able to train on shorter sequence lengths; this function does not scale
+    the training sequence length as :class:`.Alibi` does, so little speedup will be
+    observed from using it alone. See the :doc:`Method Card </method_cards/alibi>` for
+    more details. This function should be called after the model is instantiated and
+    before training begins.
+
+    Example:
+
+    .. code-block:: python
+
+        import composer.functional as cf
+
+        cf.apply_alibi(
+            model=model,
+            max_sequence_length=512
+        )
+
+    Args:
+        model (torch.nn.Module): Model to transform.
+        max_sequence_length (int): Maximum sequence length that the
+            model will be able to accept. Internally, the transformations applied by alibi
+            change sequence-shaped tensors to handle sequences up to ``max_sequence_length``.
+            Depending on ``max_sequence_length`` and ``model`` these changes could increase
+            or decrease the model's maximum sequence length.
+
+            At minimum, ``max_sequence_length`` should be set to the sequence length used
+            during training. However, if evaluating on sequence lengths longer than those
+            used in training, ``max_sequence_length`` should be set accordingly.
+
+            Note that larger ``max_sequence_length`` means a larger memory footprint of
+            the model. So, it is best to set this parameter equal the longest
+            sequence length that will be seen during training and/or evaluation.
+        optimizers (torch.optim.Optimizer | Sequence[torch.optim.Optimizer], optional):
+            Existing optimizers bound to ``model.parameters()``. All optimizers that have already been
+            constructed with ``model.parameters()`` must be specified here so
+            they will optimize the correct parameters.
+
+            If the optimizer(s) are constructed *after* calling this function,
+            then it is safe to omit this parameter. These optimizers will see the correct
+            model parameters.
+    """
+    try:
+        from composer.algorithms.alibi.attention_surgery_functions_pos import policy_registry
+    except ImportError as e:
+        raise MissingConditionalImportError(extra_deps_group='nlp', conda_package='transformers') from e
+
+    # To use model surgery utilities, we need to define a policy of type
+    # Mapping[Type[torch.nn.Module], ReplacementFunction], where ReplacementFunction is
+    # Callable[[torch.nn.Module, Optional[int]], Optional[torch.nn.Module]].
+    #
+    # This mapping is built by the source code in `./attention_surgery_functions/` but
+    # needs to be completed here by "freezing" alibi-specific arguments.
+    #
+    # For additional details, see `./attention_surgery_functions/utils.py`.
+    def as_replacement_function(surgery_function):
+
+        def replacement_function(module: torch.nn.Module, module_index: int):
+            return surgery_function(module, module_index, max_sequence_length=max_sequence_length)
+
+        return replacement_function
+
+    # Wrap each alibi_surgery_function as a ReplacementFunction by "freezing" `max_sequence_length`
+    policies = {
+        module_class: as_replacement_function(alibi_surgery_function)
+        for module_class, alibi_surgery_function in policy_registry.items()
+    }
+
+    # Note: `policies` defines replacements for _all_ the modules registered in `policy_registry`,
+    # meaning that some replacements may be irrelevant for `model`.
+    # Conversely, attention modules within `model` may be ignored if they are not registered by the
+    # implementations within `./attention_surgery_functions/`.
+    replaced_pairs = module_surgery.replace_module_classes(model, optimizers=optimizers, policies=policies)
+
+    count = len(replaced_pairs)
+    if count == 0:
+        supported_modules = ''.join(sorted(['\n\t' + c.__module__ + '.' + c.__name__ for c in policy_registry.keys()]))
+        log.warning(
+            f'ALiBi had no effect on the model! Support for ALiBi surgery '
+            f'is currently limited to the following classes: {supported_modules}',
+        )
+    else:
+        log.info(f' {count} instances of ALiBi added')
 
 def apply_alibi(
     model: torch.nn.Module,
